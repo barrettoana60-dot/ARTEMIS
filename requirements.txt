@@ -6,3 +6,4 @@ plotly
 networkx
 pyvis
 scikit-learn
+fpdf
