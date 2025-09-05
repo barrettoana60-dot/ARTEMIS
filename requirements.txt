@@ -7,3 +7,4 @@ networkx
 pyvis
 scikit-learn
 fpdf
+openpyxl
