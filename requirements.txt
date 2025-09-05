@@ -1,3 +1,6 @@
+git add requirements.txt
+git commit -m "Adiciona fpdf e demais dependências"
+git push
 streamlit
 pandas
 numpy
