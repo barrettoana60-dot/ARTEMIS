@@ -17,6 +17,9 @@ from pathlib import Path
 from datetime import datetime
 import glob
 import unicodedata
+from difflib import SequenceMatcher
+from urllib.parse import quote_plus
+from urllib.request import urlopen, Request
 
 # extra para ML/search (mantido para futura expansão)
 import joblib
@@ -302,6 +305,83 @@ def read_spreadsheet(uploaded_file):
         buf.seek(0)
         return pd.read_excel(buf)
 
+def _normalize_text(value):
+    value = str(value or "").strip().lower()
+    value = unicodedata.normalize("NFKD", value)
+    return "".join(ch for ch in value if not unicodedata.combining(ch))
+
+def build_corpus_from_df(df):
+    if df is None or df.empty:
+        return pd.DataFrame(), []
+    safe = df.fillna("").copy()
+    safe["_doc_text"] = safe.astype(str).agg(" ".join, axis=1).map(_normalize_text)
+    return safe, safe["_doc_text"].tolist()
+
+def semantic_search(df, query, top_k=20):
+    indexed, docs = build_corpus_from_df(df)
+    if indexed.empty or not query.strip():
+        return pd.DataFrame()
+    vect = TfidfVectorizer(ngram_range=(1, 2), max_features=6000)
+    matrix = vect.fit_transform(docs + [_normalize_text(query)])
+    query_vec = matrix[-1]
+    scores = cosine_similarity(matrix[:-1], query_vec).ravel()
+    indexed["_score"] = scores
+    indexed = indexed[indexed["_score"] > 0]
+    return indexed.sort_values("_score", ascending=False).head(top_k)
+
+def suggest_web_articles(query, max_results=6):
+    if not query.strip():
+        return []
+    q = quote_plus(query)
+    url = f"https://api.crossref.org/works?query={q}&rows={max_results}&sort=score&order=desc"
+    try:
+        req = Request(url, headers={"User-Agent": "ARTEMIS/1.0 (Research assistant)"})
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        items = data.get("message", {}).get("items", [])
+    except Exception:
+        return []
+    out = []
+    for it in items:
+        title = (it.get("title") or ["Sem título"])[0]
+        doi = it.get("DOI")
+        link = f"https://doi.org/{doi}" if doi else (it.get("URL") or "")
+        year = (it.get("published-print", {}).get("date-parts", [[None]])[0][0]
+                or it.get("published-online", {}).get("date-parts", [[None]])[0][0])
+        out.append({"title": title, "year": year, "link": link})
+    return out
+
+def suggest_related_terms(df, query, top_k=8):
+    if df is None or df.empty:
+        return []
+    _, docs = build_corpus_from_df(df)
+    vect = TfidfVectorizer(stop_words="english", max_features=1500)
+    matrix = vect.fit_transform(docs + [_normalize_text(query)])
+    query_vec = matrix[-1]
+    terms = np.array(vect.get_feature_names_out())
+    weights = (query_vec.toarray()[0])
+    ranked = terms[np.argsort(weights)[::-1]]
+    return [t for t in ranked if len(t) > 3][:top_k]
+
+NATIONALITY_COORDS = {
+    "brasil": (-14.2, -51.9), "brasileiro": (-14.2, -51.9),
+    "portugal": (39.4, -8.2), "portugues": (39.4, -8.2),
+    "eua": (37.1, -95.7), "estados unidos": (37.1, -95.7), "americano": (37.1, -95.7),
+    "canada": (56.1, -106.3), "franca": (46.2, 2.2), "frances": (46.2, 2.2),
+    "espanha": (40.4, -3.7), "alemanha": (51.2, 10.4), "italia": (41.9, 12.5),
+    "japao": (36.2, 138.3), "china": (35.9, 104.2), "india": (20.6, 78.9)
+}
+
+def build_image_index():
+    base_dirs = [Path("user_files"), Path("backups"), Path(".")]
+    image_paths = []
+    for base in base_dirs:
+        if not base.exists():
+            continue
+        for ext in ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.bmp"):
+            image_paths.extend(base.rglob(ext))
+    return sorted(set(image_paths))
+
 # -------------------------
 # Graph creation + plotly 3D
 # -------------------------
@@ -507,7 +587,7 @@ users = load_users()
 if not st.session_state.authenticated:
     st.markdown("<div class='glass-box auth' style='max-width:1100px;margin:0 auto; position:relative;'><div class='specular'></div>", unsafe_allow_html=True)
     st.subheader("Acesso — Faça login ou cadastre-se")
-    tabs = st.tabs(["Entrar", "Cadastrar"])
+    tabs = st.tabs(["Entrar", "Criar conta"])
     with tabs[0]:
         login_user = st.text_input("Usuário", key="ui_login_user")
         login_pass = st.text_input("Senha", type="password", key="ui_login_pass")
@@ -521,16 +601,15 @@ if not st.session_state.authenticated:
                 st.warning("Usuário ou senha incorretos.")
     with tabs[1]:
         reg_name = st.text_input("Nome completo", key="ui_reg_name")
-        reg_bolsa = st.selectbox("Tipo de bolsa", ["IC - Iniciação Científica", "BIA - Bolsa de Incentivo Acadêmico", "Extensão", "Doutorado"], key="ui_reg_bolsa")
         reg_user = st.text_input("Escolha um username", key="ui_reg_user")
-        if st.button("Cadastrar", "btn_register_main"):
+        if st.button("Criar conta", "btn_register_main"):
             if not reg_user or not reg_user.strip():
                 st.warning("Escolha um username válido.")
             elif reg_user in users:
                 st.warning("Username já existe.")
             else:
                 pwd = gen_password(8)
-                users[reg_user] = {"name": reg_name or reg_user, "scholarship": reg_bolsa, "password": pwd, "created_at": datetime.utcnow().isoformat()}
+                users[reg_user] = {"name": reg_name or reg_user, "password": pwd, "created_at": datetime.utcnow().isoformat()}
                 save_users(users)
                 st.success(f"Usuário criado. Username: **{reg_user}** — Senha gerada: **{pwd}**")
                 st.info("Anote a senha.")
@@ -554,76 +633,52 @@ if not st.session_state.restored_from_saved and os.path.exists(USER_STATE):
         pass
 
 # -------------------------
-# Módulo de Mensagens (Carregamento inicial para notificação)
-# -------------------------
-MESSAGES_PATH = Path("messages.json")
-UNREAD_COUNT = 0
-try:
-    if MESSAGES_PATH.exists():
-        with open(MESSAGES_PATH, "r", encoding="utf-8") as mf:
-            all_msgs = json.load(mf)
-            UNREAD_COUNT = sum(1 for m in all_msgs if m.get("to") == USERNAME and not m.get("read"))
-except Exception:
-    UNREAD_COUNT = 0
-
-if "last_unread_count" not in st.session_state:
-    st.session_state.last_unread_count = 0
-if UNREAD_COUNT > st.session_state.last_unread_count:
-    try:
-        st.toast(f"Você tem {UNREAD_COUNT} nova(s) mensagem(ns) não lida(s).", icon="✉️")
-    except Exception:
-        pass
-st.session_state.last_unread_count = UNREAD_COUNT
-
-mens_label = f"✉️ Mensagens ({UNREAD_COUNT})" if UNREAD_COUNT > 0 else "✉️ Mensagens"
-
-# -------------------------
 # Top controls + nav
 # -------------------------
 st.markdown("<div class='glass-box' style='padding-top:10px; padding-bottom:10px;'><div class='specular'></div>", unsafe_allow_html=True)
 
 top1, top2 = st.columns([0.6, 0.4])
 with top1:
-    st.markdown(f"<div style='color:var(--muted-text);font-weight:700; padding-top:8px;'>Usuário: {USER_OBJ.get('name','')} — {USER_OBJ.get('scholarship','')}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='color:var(--muted-text);font-weight:700; padding-top:8px;'>Usuário: {USER_OBJ.get('name','')}</div>", unsafe_allow_html=True)
 with top2:
     nav_right1, nav_right2, nav_right3 = st.columns([1,1,1])
     with nav_right1:
         ui_aut = st.checkbox("Auto-save", value=st.session_state.autosave, key="ui_autosave")
         st.session_state.autosave = ui_aut
     with nav_right2:
-        if st.button("💾 Salvar", key=f"btn_save_now", use_container_width=True):
+        if st.button("Salvar", key=f"btn_save_now", use_container_width=True):
             p = save_state_for_user(USERNAME)
             st.success(f"Progresso salvo.")
     with nav_right3:
-        if st.button("🚪 Sair", key=f"btn_logout", use_container_width=True):
+        if st.button("Sair", key=f"btn_logout", use_container_width=True):
             for key in list(st.session_state.keys()): del st.session_state[key]
             st.rerun()
 
 st.markdown("<div style='margin-top:-20px'>", unsafe_allow_html=True)
 nav1, nav2, nav3, nav4, nav5, nav6 = st.columns(6)
 with nav1:
-    if st.button("📄 Planilha", key="nav_planilha", use_container_width=True):
+    if st.button("Planilha", key="nav_planilha", use_container_width=True):
         st.session_state.page = "planilha"
         st.rerun()
 with nav2:
-    if st.button("🗺️ Mapa", key="nav_mapa", use_container_width=True):
+    if st.button("Mapa", key="nav_mapa", use_container_width=True):
         st.session_state.page = "mapa"
         st.rerun()
 with nav3:
-    if st.button("📝 Anotações", key="nav_anotacoes", use_container_width=True):
+    if st.button("Anotações", key="nav_anotacoes", use_container_width=True):
         st.session_state.page = "anotacoes"
         st.rerun()
 with nav4:
-    if st.button("📊 Gráficos", key="nav_graficos", use_container_width=True):
+    if st.button("Gráficos", key="nav_graficos", use_container_width=True):
         st.session_state.page = "graficos"
         st.rerun()
 with nav5:
-    if st.button("🔍 Busca", key="nav_busca", use_container_width=True):
+    if st.button("Pesquisa IA", key="nav_busca", use_container_width=True):
         st.session_state.page = "busca"
         st.rerun()
 with nav6:
-    if st.button(mens_label, key="nav_mensagens", use_container_width=True):
-        st.session_state.page = "mensagens"
+    if st.button("Análise IA", key="nav_analise", use_container_width=True):
+        st.session_state.page = "analise"
         st.rerun()
 st.markdown("</div></div>", unsafe_allow_html=True)
 st.markdown("---")
@@ -767,313 +822,150 @@ elif st.session_state.page == "graficos":
 
 elif st.session_state.page == "busca":
     st.markdown("<div class='glass-box' style='position:relative; padding:12px;'><div class='specular'></div>", unsafe_allow_html=True)
+    st.subheader("Pesquisa IA Unificada")
 
-    tab_busca, tab_favoritos = st.tabs(["🔍 Busca Inteligente", f"⭐ Favoritos ({len(get_session_favorites())})"])
+    backups_df = None
+    base = Path("backups")
+    if base.exists():
+        dfs = []
+        for user_dir in sorted(base.iterdir()):
+            if not user_dir.is_dir():
+                continue
+            csvs = sorted(user_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if not csvs:
+                continue
+            try:
+                part = pd.read_csv(csvs[0], encoding="utf-8", on_bad_lines="skip")
+            except Exception:
+                continue
+            part["_artemis_username"] = user_dir.name
+            dfs.append(part)
+        if dfs:
+            backups_df = pd.concat(dfs, ignore_index=True)
 
-    with tab_busca:
-        st.header("Busca Inteligente")
+    if backups_df is None or backups_df.empty:
+        st.warning("Nenhum conteúdo indexado ainda. Faça upload e salve para habilitar a busca inteligente.")
+    else:
+        query = st.text_input("Tema ou pergunta de pesquisa", placeholder="Ex.: impactos da IA na educação superior")
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            run_search = st.button("Executar busca semântica", use_container_width=True)
+        with c2:
+            run_articles = st.button("Sugerir artigos da internet", use_container_width=True)
 
-        @st.cache_data(ttl=300)
-        def collect_latest_backups():
-            base = Path("backups")
-            if not base.exists():
-                return None
-            dfs = []
-            for user_dir in sorted(base.iterdir()):
-                if not user_dir.is_dir(): continue
-                csvs = sorted(user_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-                if not csvs: continue
-                latest = csvs[0]
-                try:
-                    df = pd.read_csv(latest, encoding="utf-8", on_bad_lines='skip')
-                    df["_artemis_username"] = user_dir.name
-                    dfs.append(df)
-                except Exception:
-                    continue
-            return pd.concat(dfs, ignore_index=True) if dfs else None
+        if run_search and query:
+            results = semantic_search(backups_df.drop(columns=[c for c in ["_score"] if c in backups_df.columns]), query, top_k=25)
+            st.session_state.search_results = results
 
-        backups_df = collect_latest_backups()
+        results = st.session_state.get("search_results", pd.DataFrame())
+        if isinstance(results, pd.DataFrame) and not results.empty:
+            st.markdown(f"**{len(results)} resultados semânticos encontrados.**")
+            show = results.head(20).copy()
+            if "_doc_text" in show.columns:
+                show = show.drop(columns=["_doc_text"])
+            st.dataframe(show, use_container_width=True)
 
-        if backups_df is None:
-            st.warning("Nenhum backup de usuário encontrado para a busca. Salve seu progresso para criar um.")
-        else:
-            all_cols = [c for c in backups_df.columns if c != '_artemis_username']
+            st.markdown("### Conexões entre pesquisas semelhantes")
+            link_graph = nx.Graph()
+            top_res = results.head(15)
+            for i, row in top_res.iterrows():
+                label = str(row.get("Título", row.get("titulo", f"Registro {i}")))[:80]
+                link_graph.add_node(label)
+            labels = list(link_graph.nodes())
+            for i in range(len(labels)):
+                for j in range(i + 1, len(labels)):
+                    a, b = labels[i], labels[j]
+                    sim = SequenceMatcher(None, _normalize_text(a), _normalize_text(b)).ratio()
+                    if sim >= 0.5:
+                        link_graph.add_edge(a, b, weight=sim)
+            st.plotly_chart(graph_to_plotly_3d(link_graph, show_labels=True, height=550), use_container_width=True)
 
-            col1, col2, col3 = st.columns([0.6, 0.25, 0.15])
-            with col1:
-                query = st.text_input("Termo de busca", key="ui_query_search", placeholder="Digite palavras-chave...")
-            with col2:
-                search_col = st.selectbox("Buscar em", options=all_cols, label_visibility="visible")
-            with col3:
-                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-                search_clicked = st.button("Buscar", use_container_width=True)
+        if run_articles and query:
+            web_items = suggest_web_articles(query, max_results=8)
+            st.markdown("### Sugestões de artigos na internet")
+            if not web_items:
+                st.info("Não foi possível buscar artigos externos no momento.")
+            for item in web_items:
+                st.markdown(f"- **{item['title']}** ({item.get('year') or 's/d'}) — {item.get('link','')}")
 
-            if 'search_results' not in st.session_state:
-                st.session_state.search_results = pd.DataFrame()
+        if query:
+            st.markdown("### Termos sugeridos para refinar a pesquisa")
+            terms = suggest_related_terms(backups_df, query)
+            if terms:
+                st.write(", ".join(terms))
+            else:
+                st.caption("Sem termos suficientes para sugerir no momento.")
 
-            if search_clicked:
-                if query and search_col:
-                    results = backups_df[backups_df[search_col].astype(str).str.contains(query, case=False, na=False)]
-                    st.session_state.search_results = results
-                else:
-                    st.session_state.search_results = pd.DataFrame()
-
-            results_df = st.session_state.search_results
-            if not results_df.empty:
-                st.markdown(f"**{len(results_df)} resultado(s) encontrado(s).** Exibindo os 20 primeiros.")
-                st.markdown("---")
-
-                for idx, row in results_df.head(20).iterrows():
-                    with st.container(border=True):
-                        result_data = row.to_dict()
-                        username = result_data.get('_artemis_username', 'N/A')
-                        col_info, col_action = st.columns([0.8, 0.2])
-                        with col_info:
-                            user_icon_svg = icon_html_svg('register', size=18, color='var(--muted-text)')
-                            st.markdown(f"""
-                            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px; color: var(--muted-text);">
-                                {user_icon_svg}
-                                <span>Encontrado no trabalho de <strong style="color: #e1e3e6;">{username}</strong></span>
-                            </div>
-                            """, unsafe_allow_html=True)
-                            display_data = result_data.copy()
-                            display_data.pop('_artemis_username', None)
-                            for k, v in display_data.items():
-                                st.markdown(f"**{str(k).capitalize()}:** {v}")
-
-                        with col_action:
-                            if action_button("Favoritar", "favoritos", f"fav_{idx}", wide=True):
-                                if add_to_favorites(result_data):
-                                    st.toast("Adicionado!", icon="⭐")
-                                    save_state_for_user(USERNAME)
-                                else:
-                                    st.toast("Já está nos favoritos.")
-            elif search_clicked:
-                st.info("Nenhum resultado encontrado para a sua busca.")
-
-    with tab_favoritos:
-        st.header("Seus Resultados Salvos")
-        favorites = get_session_favorites()
-
-        if not favorites:
-            st.info("Você ainda não favoritou nenhum resultado.")
-        else:
-            _, col_clear = st.columns([0.7, 0.3])
-            with col_clear:
-                if action_button("Limpar Todos", "trash", "clear_favs", wide=True):
-                    clear_all_favorites()
-                    save_state_for_user(USERNAME)
-                    st.rerun()
-
-            st.markdown("---")
-            sorted_favorites = sorted(favorites, key=lambda x: x['added_at'], reverse=True)
-
-            for fav in sorted_favorites:
-                with st.container(border=True):
-                    col_info, col_action = st.columns([0.8, 0.2])
-                    with col_info:
-                        fav_data = fav['data'].copy()
-                        source_user = fav_data.pop('_artemis_username', 'N/A')
-
-                        user_icon_svg = icon_html_svg('register', size=18, color='var(--muted-text)')
-                        st.markdown(f"""
-                        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 10px; color: var(--muted-text);">
-                            {user_icon_svg}
-                            <span>Proveniente do trabalho de <strong style="color: #e1e3e6;">{source_user}</strong></span>
-                        </div>
-                        """, unsafe_allow_html=True)
-                        for k, v in fav_data.items():
-                            st.markdown(f"**{k.capitalize()}:** {v}")
-                    with col_action:
-                        if action_button("Remover", "trash", f"del_fav_{fav['id']}", wide=True):
-                            remove_from_favorites(fav['id'])
-                            save_state_for_user(USERNAME)
-                            st.rerun()
+            st.markdown("### Busca de imagens semelhantes (pastas de usuários + internet)")
+            image_idx = build_image_index()
+            local_hits = [p for p in image_idx if _normalize_text(query) in _normalize_text(p.name)]
+            if local_hits:
+                st.write("Arquivos locais semelhantes:")
+                for p in local_hits[:12]:
+                    st.markdown(f"- {p}")
+            else:
+                st.caption("Nenhuma imagem local semelhante encontrada pelo nome do arquivo.")
+            st.markdown(f"Pesquise imagens externas: https://www.google.com/search?tbm=isch&q={quote_plus(query)}")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# --- [INÍCIO DO MÓDULO DE MENSAGENS CORRIGIDO] ---
-elif st.session_state.page == "mensagens":
-    MESSAGES_FILE = "messages.json"
-    ATTACHMENTS_DIR = Path("user_files")
-    ATTACHMENTS_DIR.mkdir(exist_ok=True)
-
-    def load_all_messages():
-        if os.path.exists(MESSAGES_FILE):
-            try:
-                with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                return []
-        return []
-
-    def save_all_messages(msgs):
-        with open(MESSAGES_FILE, "w", encoding="utf-8") as f:
-            json.dump(msgs, f, ensure_ascii=False, indent=2)
-
-    def send_message(sender, recipient, subject, body, attachment_file=None):
-        msgs = load_all_messages()
-        mid = f"m_{int(time.time())}_{random.randint(1000,9999)}"
-        entry = {
-            "id": mid,
-            "from": sender,
-            "to": recipient,
-            "subject": subject or "(sem assunto)",
-            "body": body,
-            "ts": datetime.utcnow().isoformat(),
-            "read": False,
-            "attachment": None
-        }
-        
-        if attachment_file:
-            safe_filename = re.sub(r'[^\w\.\-]', '_', attachment_file.name)
-            unique_filename = f"{int(time.time())}_{sender}_{safe_filename}"
-            save_path = ATTACHMENTS_DIR / unique_filename
-            
-            with open(save_path, "wb") as f:
-                f.write(attachment_file.getbuffer())
-            entry["attachment"] = {"name": attachment_file.name, "path": str(save_path)}
-
-        msgs.append(entry)
-        save_all_messages(msgs)
-        return entry
-
-    def get_user_messages(username, box_type='inbox'):
-        msgs = load_all_messages()
-        key = "to" if box_type == 'inbox' else "from"
-        user_msgs = [m for m in msgs if m.get(key) == username]
-        user_msgs.sort(key=lambda x: x.get("ts", ""), reverse=True)
-        return user_msgs
-
-    def mark_message_read(message_id, username):
-        msgs = load_all_messages()
-        changed = False
-        for m in msgs:
-            if m.get("id") == message_id and m.get("to") == username:
-                if not m.get("read"):
-                    m["read"] = True
-                    changed = True
-                break
-        if changed:
-            save_all_messages(msgs)
-        return changed
-
-    def delete_message(message_id, username):
-        msgs = load_all_messages()
-        msg_to_delete = None
-        for m in msgs:
-            if m.get("id") == message_id and (m.get("to") == username or m.get("from") == username):
-                msg_to_delete = m
-                break
-        
-        if msg_to_delete:
-            if msg_to_delete.get("attachment"):
-                try:
-                    os.remove(msg_to_delete["attachment"]["path"])
-                except OSError:
-                    pass
-            
-            new_msgs = [m for m in msgs if m.get("id") != message_id]
-            save_all_messages(new_msgs)
-            return True
-        return False
-
+elif st.session_state.page == "analise":
     st.markdown("<div class='glass-box' style='position:relative; padding:12px;'><div class='specular'></div>", unsafe_allow_html=True)
-    st.subheader("Central de Mensagens")
+    st.subheader("Análise completa da pesquisa")
 
-    inbox = get_user_messages(USERNAME, 'inbox')
-    outbox = get_user_messages(USERNAME, 'outbox')
+    if st.session_state.df is None or st.session_state.df.empty:
+        st.warning("Carregue uma planilha para gerar análise completa por ano, tema, autor e nacionalidade.")
+    else:
+        df = st.session_state.df.copy()
+        cols_map = {c.lower(): c for c in df.columns}
 
-    tab_inbox, tab_compose, tab_sent = st.tabs([f"📥 Caixa de Entrada ({UNREAD_COUNT})", "✍️ Escrever Nova", f"📤 Enviadas ({len(outbox)})"])
+        c_ano = cols_map.get("ano")
+        c_tema = cols_map.get("tema")
+        c_autor = cols_map.get("autor")
+        c_nat = cols_map.get("nacionalidade")
+        c_resumo = cols_map.get("resumo")
 
-    with tab_inbox:
-        if not inbox:
-            st.info("Sua caixa de entrada está vazia.")
-        else:
-            for m in inbox:
-                is_read = m.get("read", False)
-                expander_label = f"{'✅' if is_read else '🔵'} De: **{m.get('from')}** | Assunto: **{m.get('subject')}**"
-                with st.expander(expander_label):
-                    st.markdown(f"**Recebido em:** `{m.get('ts')}`")
-                    st.markdown("---")
-                    st.markdown(m.get("body"))
-                    
-                    if not is_read:
-                        mark_message_read(m.get('id'), USERNAME)
-                        st.rerun()
+        if c_ano:
+            fig_ano = px.histogram(df, x=c_ano, title="Distribuição por ano")
+            fig_ano.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_ano, use_container_width=True)
 
-                    if m.get("attachment"):
-                        attachment_info = m["attachment"]
-                        st.markdown("---")
-                        try:
-                            with open(attachment_info["path"], "rb") as fp:
-                                st.download_button(
-                                    label=f"⬇️ Baixar Anexo: {attachment_info['name']}",
-                                    data=fp,
-                                    file_name=attachment_info["name"],
-                                    key=f"dl_{m.get('id')}"
-                                )
-                        except FileNotFoundError:
-                            st.warning("O anexo não foi encontrado no servidor.")
-                    
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if st.button("Responder", key=f"reply_{m.get('id')}", use_container_width=True):
-                            st.session_state.compose_to = m.get('from')
-                            st.session_state.compose_subject = f"Re: {m.get('subject')}"
-                            st.rerun()
-                    with c2:
-                        if st.button("Apagar", key=f"del_inbox_{m.get('id')}", use_container_width=True):
-                            delete_message(m.get('id'), USERNAME)
-                            st.toast("Mensagem apagada.")
-                            st.rerun()
+        if c_tema:
+            top_tema = df[c_tema].astype(str).value_counts().head(12).reset_index()
+            top_tema.columns = ["tema", "qtd"]
+            fig_tema = px.bar(top_tema, x="tema", y="qtd", title="Temas mais recorrentes")
+            fig_tema.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_tema, use_container_width=True)
 
-    with tab_compose:
-        with st.form(key="compose_form", clear_on_submit=True):
-            all_usernames = list(load_users().keys())
-            if USERNAME in all_usernames:
-                all_usernames.remove(USERNAME)
+        if c_autor:
+            top_autor = df[c_autor].astype(str).value_counts().head(12).reset_index()
+            top_autor.columns = ["autor", "qtd"]
+            fig_autor = px.bar(top_autor, x="autor", y="qtd", title="Autores com mais artigos")
+            fig_autor.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_autor, use_container_width=True)
 
-            # Define default index for recipient
-            default_recipient = st.session_state.get('compose_to', '')
-            try:
-                recipient_index = all_usernames.index(default_recipient) if default_recipient in all_usernames else 0
-            except (ValueError, IndexError):
-                 recipient_index = 0
+        if c_nat:
+            nat_count = df[c_nat].astype(str).map(_normalize_text).value_counts().reset_index()
+            nat_count.columns = ["nacionalidade", "qtd"]
+            nat_count["lat"] = nat_count["nacionalidade"].map(lambda n: NATIONALITY_COORDS.get(n, (None, None))[0])
+            nat_count["lon"] = nat_count["nacionalidade"].map(lambda n: NATIONALITY_COORDS.get(n, (None, None))[1])
+            geo_df = nat_count.dropna(subset=["lat", "lon"])
+            if not geo_df.empty:
+                fig_geo = px.scatter_geo(
+                    geo_df,
+                    lat="lat", lon="lon", size="qtd", color="qtd",
+                    hover_name="nacionalidade", projection="orthographic",
+                    title="Mapa 3D de nacionalidade dos autores"
+                )
+                fig_geo.update_geos(showland=True, showcountries=True)
+                fig_geo.update_layout(paper_bgcolor="rgba(0,0,0,0)")
+                st.plotly_chart(fig_geo, use_container_width=True)
+            else:
+                st.info("Não foi possível mapear nacionalidades automaticamente. Use nomes de países no campo 'nacionalidade'.")
 
-            to_user = st.selectbox("Para:", options=all_usernames, index=recipient_index, key='ui_msg_to')
-            subj = st.text_input("Assunto:", value=st.session_state.get('compose_subject',''), key='ui_msg_subj')
-            body = st.text_area("Mensagem:", value="", height=200, key='ui_msg_body')
-            attachment = st.file_uploader("Anexar arquivo (Dropbox):", key="ui_msg_attachment")
-            
-            submitted = st.form_submit_button("✉️ Enviar Mensagem", use_container_width=True)
-
-            if submitted:
-                if not to_user:
-                    st.error("Destinatário inválido.")
-                else:
-                    send_message(USERNAME, to_user, subj, body, attachment_file=attachment)
-                    st.success(f"Mensagem enviada para {to_user}.")
-                    st.session_state.compose_to = ''
-                    st.session_state.compose_subject = ''
-                    if st.session_state.autosave:
-                        save_state_for_user(USERNAME)
-                    st.rerun()
-
-    with tab_sent:
-        if not outbox:
-            st.info("Você ainda não enviou mensagens.")
-        else:
-            for m in outbox:
-                with st.expander(f"Para: **{m.get('to')}** | Assunto: **{m.get('subject')}**"):
-                    st.markdown(f"**Enviado em:** `{m.get('ts')}`")
-                    st.markdown("---")
-                    st.markdown(m.get("body"))
-                    if m.get("attachment"):
-                        st.info(f"Anexo enviado: {m['attachment']['name']}")
-                    if st.button("Apagar", key=f"del_outbox_{m.get('id')}", use_container_width=True):
-                        delete_message(m.get('id'), USERNAME)
-                        st.toast("Mensagem apagada.")
-                        st.rerun()
+        if c_resumo:
+            st.markdown("### Resumos dos artigos")
+            for i, resumo in enumerate(df[c_resumo].dropna().astype(str).head(20), start=1):
+                st.markdown(f"**Resumo {i}:** {resumo}")
 
     st.markdown("</div>", unsafe_allow_html=True)
